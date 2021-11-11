@@ -5,12 +5,12 @@ import logging
 import vatnumber
 
 from decimal import Decimal
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
-from django.db import models, transaction
+from django.db import models
+from django.db.models import Max
 
 from django.conf import settings
-from django.contrib.auth import get_user_model
 try:
     from django.contrib.sites.models import Site
 except RuntimeError:
@@ -21,13 +21,14 @@ from django.template import Context
 from django.template.base import Template
 from django.utils import translation
 from django.utils.timezone import now
+from six import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _, pgettext_lazy
 
 from django_countries.fields import CountryField
 from ordered_model.models import OrderedModel
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 
-from plans.enumeration import Enumeration
+from plans.enum import Enumeration
 from plans.validators import plan_validation
 from plans.taxation.eu import EUTaxationPolicy
 from plans.contrib import send_template_email, get_user_language
@@ -35,13 +36,13 @@ from plans.signals import (order_completed, account_activated,
                            account_expired, account_change_plan,
                            account_deactivated)
 
-from sequences import get_next_value
 
 accounts_logger = logging.getLogger('accounts')
 
 # Create your models here.
 
 
+@python_2_unicode_compatible
 class Plan(OrderedModel):
     """
     Single plan defined in the system. A plan can customized (referred to user) which means
@@ -55,13 +56,7 @@ class Plan(OrderedModel):
     """
     name = models.CharField(_('name'), max_length=100)
     description = models.TextField(_('description'), blank=True)
-    default = models.BooleanField(
-        help_text=_('Both "Unknown" and "No" means that the plan is not default'),
-        default=None,
-        db_index=True,
-        unique=True,
-        null=True,
-    )
+    default = models.BooleanField(default=False, db_index=True)
     available = models.BooleanField(
         _('available'), default=False, db_index=True,
         help_text=_('Is still available for purchase')
@@ -95,29 +90,20 @@ class Plan(OrderedModel):
     def get_default_plan(cls):
         try:
             return_value = cls.objects.get(default=True)
+        except cls.MultipleObjectsReturned:
+            return_value = cls.objects.first()
         except cls.DoesNotExist:
             return_value = None
         return return_value
-
-    @classmethod
-    def get_current_plan(cls, user):
-        """ Get current plan for user. If userplan is expired, get default plan """
-        if not user or user.is_anonymous or not hasattr(user, 'userplan') or user.userplan.is_expired():
-            default_plan = Plan.get_default_plan()
-            if default_plan is None or not default_plan.is_free():
-                raise ValidationError(_('User plan has expired'))
-            return default_plan
-        return user.userplan.plan
 
     def __str__(self):
         return self.name
 
     def get_quota_dict(self):
-        return dict(self.planquota_set.values_list('quota__codename', 'value'))
-
-    def is_free(self):
-        return self.planpricing_set.count() == 0
-    is_free.boolean = True
+        quota_dic = {}
+        for plan_quota in PlanQuota.objects.filter(plan=self).select_related('quota'):
+            quota_dic[plan_quota.quota.codename] = plan_quota.value
+        return quota_dic
 
 
 class BillingInfo(models.Model):
@@ -150,25 +136,16 @@ class BillingInfo(models.Model):
         verbose_name_plural = _("Billing infos")
 
     @staticmethod
-    def get_full_tax_number(tax_number, country):
-        number = tax_number
-        if tax_number.startswith(country):
-            number = tax_number[len(country):]
-        return country + number
-
-    @staticmethod
     def clean_tax_number(tax_number, country):
         tax_number = re.sub(r'[^A-Z0-9]', '', tax_number.upper())
-
-        country_str = tax_number[:len(country)]
-        if country_str.isalpha() and country_str != country:
-            raise ValidationError(_('VAT ID country code doesn\'t corespond with country'))
-
         if tax_number and country:
 
             if country in vatnumber.countries():
-                full_number = BillingInfo.get_full_tax_number(tax_number, country)
-                if not vatnumber.check_vat(full_number):
+                number = tax_number
+                if tax_number.startswith(country):
+                    number = tax_number[len(country):]
+
+                if not vatnumber.check_vat(country + number):
                     #           This is a proper solution to bind ValidationError to a Field but it is not
                     #           working due to django bug :(
                     #                    errors = defaultdict(list)
@@ -186,6 +163,7 @@ class BillingInfo(models.Model):
 #        super(BillingInfo, self).clean()
 #        self.tax_number = BillingInfo.clean_tax_number(self.tax_number, self.country)
 
+@python_2_unicode_compatible
 class UserPlan(models.Model):
     """
     Currently selected plan for user account.
@@ -247,56 +225,10 @@ class UserPlan(models.Model):
         Set up user plan for first use
         """
         if not self.is_active():
-            # Plans without pricings don't need to expire
-            if self.expire is None and self.plan.planpricing_set.count():
+            if self.expire is None:
                 self.expire = now() + timedelta(
                     days=getattr(settings, 'PLANS_DEFAULT_GRACE_PERIOD', 30))
             self.activate()  # this will call self.save()
-
-    def get_plan_extended_from(self, plan):
-        if plan.is_free():
-            return None
-        if not self.is_expired() and self.expire is not None and self.plan == plan:
-            return self.expire
-        return date.today()
-
-    def has_automatic_renewal(self):
-        return hasattr(self, 'recurring') and self.recurring.has_automatic_renewal and self.recurring.token_verified
-
-    def get_plan_extended_until(self, plan, pricing):
-        if plan.is_free():
-            return None
-        if pricing is None:
-            return self.expire
-        return self.get_plan_extended_from(plan) + timedelta(days=pricing.period)
-
-    def plan_autorenew_at(self):
-        """
-        Helper function which calculates when the plan autorenewal will occur
-        """
-        if self.expire:
-            plans_autorenew_before_days = getattr(settings, 'PLANS_AUTORENEW_BEFORE_DAYS', 0)
-            plans_autorenew_before_hours = getattr(settings, 'PLANS_AUTORENEW_BEFORE_HOURS', 0)
-            return self.expire - timedelta(days=plans_autorenew_before_days, hours=plans_autorenew_before_hours)
-
-    def set_plan_renewal(self, order, has_automatic_renewal=True, **kwargs):
-        """
-        Creates or updates plan renewal information for this userplan with given order
-        """
-        if hasattr(self, 'recurring'):
-            # Delete the plan to populate with default values
-            # We don't want to mix the old and new values
-            self.recurring.delete()
-        recurring = RecurringUserPlan.objects.create(
-            user_plan=self,
-            pricing=order.pricing,
-            amount=order.amount,
-            tax=order.tax,
-            currency=order.currency,
-            has_automatic_renewal=has_automatic_renewal,
-            **kwargs,
-        )
-        return recurring
 
     def extend_account(self, plan, pricing):
         """
@@ -307,22 +239,15 @@ class UserPlan(models.Model):
         """
 
         status = False  # flag; if extending account was successful?
-        expire = self.get_plan_extended_until(plan, pricing)
         if pricing is None:
             # Process a plan change request (downgrade or upgrade)
             # No account activation or extending at this point
             self.plan = plan
-
-            if self.expire is not None and not plan.planpricing_set.count():
-                # Assume no expiry date for plans without pricing.
-                self.expire = None
-
             self.save()
             account_change_plan.send(sender=self, user=self.user)
-            if getattr(settings, 'PLANS_SEND_EMAILS_PLAN_CHANGED', True):
-                mail_context = {'user': self.user, 'userplan': self, 'plan': plan}
-                send_template_email([self.user.email], 'mail/change_plan_title.txt', 'mail/change_plan_body.txt',
-                                    mail_context, get_user_language(self.user))
+            mail_context = {'user': self.user, 'userplan': self, 'plan': plan}
+            send_template_email([self.user.email], 'mail/change_plan_title.txt', 'mail/change_plan_body.txt',
+                                mail_context, get_user_language(self.user))
             accounts_logger.info(
                 "Account '%s' [id=%d] plan changed to '%s' [id=%d]" % (self.user, self.user.pk, plan, plan.pk))
             status = True
@@ -330,12 +255,19 @@ class UserPlan(models.Model):
             # Processing standard account extending procedure
             if self.plan == plan:
                 status = True
+                if self.expire is None:
+                    pass
+                elif self.expire > date.today():
+                    self.expire += timedelta(days=pricing.period)
+                else:
+                    self.expire = date.today() + timedelta(days=pricing.period)
+
             else:
                 # This should not ever happen (as this case should be managed by plan change request)
                 # but just in case we consider a case when user has a different plan
-                if not self.plan.is_free() and self.expire is None:
+                if self.expire is None:
                     status = True
-                elif not self.plan.is_free() and self.expire > date.today():
+                elif self.expire > date.today():
                     status = False
                     accounts_logger.warning("Account '%s' [id=%d] plan NOT changed to '%s' [id=%d]" % (
                         self.user, self.user.pk, plan, plan.pk))
@@ -343,20 +275,18 @@ class UserPlan(models.Model):
                     status = True
                     account_change_plan.send(sender=self, user=self.user)
                     self.plan = plan
+                    self.expire = date.today() + timedelta(days=pricing.period)
 
             if status:
-                self.expire = expire
                 self.save()
                 accounts_logger.info("Account '%s' [id=%d] has been extended by %d days using plan '%s' [id=%d]" % (
                     self.user, self.user.pk, pricing.period, plan, plan.pk))
-                if getattr(settings, 'PLANS_SEND_EMAILS_PLAN_EXTENDED', True):
-                    mail_context = {'user': self.user,
-                                    'userplan': self,
-                                    'plan': plan,
-                                    'pricing': pricing}
-                    send_template_email([self.user.email], 'mail/extend_account_title.txt',
-                                        'mail/extend_account_body.txt',
-                                        mail_context, get_user_language(self.user))
+                mail_context = {'user': self.user,
+                                'userplan': self,
+                                'plan': plan,
+                                'pricing': pricing}
+                send_template_email([self.user.email], 'mail/extend_account_title.txt', 'mail/extend_account_body.txt',
+                                    mail_context, get_user_language(self.user))
 
         if status:
             self.clean_activation()
@@ -388,93 +318,8 @@ class UserPlan(models.Model):
         send_template_email([self.user.email], 'mail/remind_expire_title.txt', 'mail/remind_expire_body.txt',
                             mail_context, get_user_language(self.user))
 
-    @classmethod
-    def create_for_user(cls, user):
-        default_plan = Plan.get_default_plan()
-        if default_plan is not None:
-            return UserPlan.objects.create(
-                user=user,
-                plan=default_plan,
-                active=False,
-                expire=None,
-            )
 
-    @classmethod
-    def create_for_users_without_plan(cls):
-        userplans = get_user_model().objects.filter(userplan=None)
-        for user in userplans:
-            UserPlan.create_for_user(user)
-        return userplans
-
-    def get_current_plan(self):
-        """ Tiny helper, very usefull in templates """
-        return Plan.get_current_plan(self.user)
-
-
-class RecurringUserPlan(models.Model):
-    """
-    OneToOne model associated with UserPlan that stores information about the plan recurrence.
-
-    More about recurring payments in docs.
-    """
-    user_plan = models.OneToOneField('UserPlan', on_delete=models.CASCADE, related_name='recurring')
-    token = models.CharField(
-        _('recurring token'),
-        help_text=_('Token, that will be used for payment renewal. Depends on used payment provider'),
-        max_length=255,
-        default=None,
-        null=True,
-        blank=True,
-    )
-    payment_provider = models.CharField(
-        _('payment provider'),
-        help_text=_('Provider, that will be used for payment renewal'),
-        max_length=255,
-        default=None,
-        null=True,
-        blank=True,
-    )
-    pricing = models.ForeignKey('Pricing', help_text=_('Recurring pricing'), default=None,
-                                null=True, blank=True, on_delete=models.CASCADE)
-    amount = models.DecimalField(
-        _('amount'), max_digits=7, decimal_places=2, db_index=True, null=True, blank=True)
-    tax = models.DecimalField(_('tax'), max_digits=4, decimal_places=2, db_index=True, null=True,
-                              blank=True)  # Tax=None is when tax is not applicable
-    currency = models.CharField(_('currency'), max_length=3)
-    has_automatic_renewal = models.BooleanField(
-        _('has automatic plan renewal'),
-        help_text=_(
-            'Automatic renewal is enabled for associated plan. '
-            'If False, the plan renewal can be still initiated by user.',
-        ),
-        default=False,
-    )
-    token_verified = models.BooleanField(
-        _('token has been verified by payment'),
-        help_text=_(
-            'The recurring token has been verified by at least one payment to be working.',
-        ),
-        default=False,
-    )
-    card_expire_year = models.IntegerField(null=True, blank=True)
-    card_expire_month = models.IntegerField(null=True, blank=True)
-    card_masked_number = models.CharField(null=True, blank=True, max_length=255)
-
-    def create_renew_order(self):
-        """
-        Create order for plan renewal
-        """
-        userplan = self.user_plan
-        return Order.objects.create(
-            user=userplan.user,
-            plan=userplan.plan,
-            pricing=userplan.recurring.pricing,
-            amount=userplan.recurring.amount,
-            tax=userplan.recurring.tax,
-            currency=userplan.recurring.currency,
-        )
-
-
+@python_2_unicode_compatible
 class Pricing(models.Model):
     """
     Type of plan period that could be purchased (e.g. 10 days, month, year, etc)
@@ -494,6 +339,7 @@ class Pricing(models.Model):
         return "%s (%d " % (self.name, self.period) + "%s)" % _("days")
 
 
+@python_2_unicode_compatible
 class Quota(OrderedModel):
     """
     Single countable or boolean property of system (limitation).
@@ -517,25 +363,20 @@ class Quota(OrderedModel):
 
 
 class PlanPricingManager(models.Manager):
-    def get_queryset(self):
-        return super(PlanPricingManager, self).get_queryset().select_related('plan', 'pricing')
+    def get_query_set(self):
+        return super(PlanPricingManager, self).get_query_set().select_related('plan', 'pricing')
 
 
+@python_2_unicode_compatible
 class PlanPricing(models.Model):
     plan = models.ForeignKey('Plan', on_delete=models.CASCADE)
     pricing = models.ForeignKey('Pricing', on_delete=models.CASCADE)
     price = models.DecimalField(max_digits=7, decimal_places=2, db_index=True)
-    order = models.IntegerField(default=0, null=False, blank=False)
-    has_automatic_renewal = models.BooleanField(
-        _('has automatic renewal'),
-        help_text=_('Use automatic renewal if possible?'),
-        default=False,
-    )
 
     objects = PlanPricingManager()
 
     class Meta:
-        ordering = ('order', 'pricing__period', )
+        ordering = ('pricing__period', )
         verbose_name = _("Plan pricing")
         verbose_name_plural = _("Plans pricings")
 
@@ -544,14 +385,14 @@ class PlanPricing(models.Model):
 
 
 class PlanQuotaManager(models.Manager):
-    def get_queryset(self):
-        return super(PlanQuotaManager, self).get_queryset().select_related('plan', 'quota')
+    def get_query_set(self):
+        return super(PlanQuotaManager, self).get_query_set().select_related('plan', 'quota')
 
 
 class PlanQuota(models.Model):
     plan = models.ForeignKey('Plan', on_delete=models.CASCADE)
     quota = models.ForeignKey('Quota', on_delete=models.CASCADE)
-    value = models.BigIntegerField(default=1, null=True, blank=True)
+    value = models.IntegerField(default=1, null=True, blank=True)
 
     objects = PlanQuotaManager()
 
@@ -560,6 +401,7 @@ class PlanQuota(models.Model):
         verbose_name_plural = _("Plans quotas")
 
 
+@python_2_unicode_compatible
 class Order(models.Model):
     """
     Order in this app supports only one item per order. This item is defined by
@@ -587,18 +429,6 @@ class Order(models.Model):
     created = models.DateTimeField(_('created'), db_index=True)
     completed = models.DateTimeField(
         _('completed'), null=True, blank=True, db_index=True)
-    plan_extended_from = models.DateField(
-        _('plan extended from'),
-        help_text=_('The plan was extended from this date'),
-        null=True,
-        blank=True,
-    )
-    plan_extended_until = models.DateField(
-        _('plan extended until'),
-        help_text=('The plan was extended until this date'),
-        null=True,
-        blank=True,
-    )
     amount = models.DecimalField(
         _('amount'), max_digits=7, decimal_places=2, db_index=True)
     tax = models.DecimalField(_('tax'), max_digits=4, decimal_places=2, db_index=True, null=True,
@@ -635,17 +465,9 @@ class Order(models.Model):
         return self.status == self.STATUS.NEW and (now() - self.created).days < getattr(
             settings, 'PLANS_ORDER_EXPIRATION', 14)
 
-    def get_plan_extended_from(self):
-        return self.user.userplan.get_plan_extended_from(self.plan)
-
-    def get_plan_extended_until(self):
-        return self.user.userplan.get_plan_extended_until(self.plan, self.pricing)
-
     def complete_order(self):
         if self.completed is None:
-            self.plan_extended_from = self.get_plan_extended_from()
             status = self.user.userplan.extend_account(self.plan, self.pricing)
-            self.plan_extended_until = self.user.userplan.expire
             self.completed = now()
             if status:
                 self.status = Order.STATUS.COMPLETED
@@ -665,9 +487,6 @@ class Order(models.Model):
 
     def get_all_invoices(self):
         return self.invoice_set.order_by('issued', 'issued_duplicate', 'pk')
-
-    def get_plan_pricing(self):
-        return PlanPricing.objects.get(plan=self.plan, pricing=self.pricing)
 
     def tax_total(self):
         if self.tax is None:
@@ -691,24 +510,21 @@ class Order(models.Model):
 
 
 class InvoiceManager(models.Manager):
-    def get_queryset(self):
-        return super(InvoiceManager, self).get_queryset().filter(type=Invoice.INVOICE_TYPES['INVOICE'])
+    def get_query_set(self):
+        return super(InvoiceManager, self).get_query_set().filter(type=Invoice.INVOICE_TYPES['INVOICE'])
 
 
 class InvoiceProformaManager(models.Manager):
-    def get_queryset(self):
-        return super(InvoiceProformaManager, self).get_queryset().filter(type=Invoice.INVOICE_TYPES['PROFORMA'])
+    def get_query_set(self):
+        return super(InvoiceProformaManager, self).get_query_set().filter(type=Invoice.INVOICE_TYPES['PROFORMA'])
 
 
 class InvoiceDuplicateManager(models.Manager):
-    def get_queryset(self):
-        return super(InvoiceDuplicateManager, self).get_queryset().filter(type=Invoice.INVOICE_TYPES['DUPLICATE'])
+    def get_query_set(self):
+        return super(InvoiceDuplicateManager, self).get_query_set().filter(type=Invoice.INVOICE_TYPES['DUPLICATE'])
 
 
-def get_initial_number(older_invoices):
-    return getattr(older_invoices.order_by("number").last(), 'number', 0) + 1
-
-
+@python_2_unicode_compatible
 class Invoice(models.Model):
     """
     Single invoice document.
@@ -754,21 +570,21 @@ class Invoice(models.Model):
         max_digits=4, decimal_places=2, default=Decimal(0))
     currency = models.CharField(max_length=3, default='EUR')
     item_description = models.CharField(max_length=200)
-    buyer_name = models.CharField(max_length=200, verbose_name=_("Name"), blank=True)
-    buyer_street = models.CharField(max_length=200, verbose_name=_("Street"), blank=True)
+    buyer_name = models.CharField(max_length=200, verbose_name=_("Name"))
+    buyer_street = models.CharField(max_length=200, verbose_name=_("Street"))
     buyer_zipcode = models.CharField(
-        max_length=200, verbose_name=_("Zip code"), blank=True)
-    buyer_city = models.CharField(max_length=200, verbose_name=_("City"), blank=True)
-    buyer_country = CountryField(verbose_name=_("Country"), default='PL', blank=True)
+        max_length=200, verbose_name=_("Zip code"))
+    buyer_city = models.CharField(max_length=200, verbose_name=_("City"))
+    buyer_country = CountryField(verbose_name=_("Country"), default='PL')
     buyer_tax_number = models.CharField(
         max_length=200, blank=True, verbose_name=_("TAX/VAT number"))
-    shipping_name = models.CharField(max_length=200, verbose_name=_("Name"), blank=True)
+    shipping_name = models.CharField(max_length=200, verbose_name=_("Name"))
     shipping_street = models.CharField(
-        max_length=200, verbose_name=_("Street"), blank=True)
+        max_length=200, verbose_name=_("Street"))
     shipping_zipcode = models.CharField(
-        max_length=200, verbose_name=_("Zip code"), blank=True)
-    shipping_city = models.CharField(max_length=200, verbose_name=_("City"), blank=True)
-    shipping_country = CountryField(verbose_name=_("Country"), default='PL', blank=True)
+        max_length=200, verbose_name=_("Zip code"))
+    shipping_city = models.CharField(max_length=200, verbose_name=_("City"))
+    shipping_country = CountryField(verbose_name=_("Country"), default='PL')
     require_shipment = models.BooleanField(default=False, db_index=True)
     issuer_name = models.CharField(max_length=200, verbose_name=_("Name"))
     issuer_street = models.CharField(max_length=200, verbose_name=_("Street"))
@@ -793,51 +609,25 @@ class Invoice(models.Model):
         if self.number is None:
             invoice_counter_reset = getattr(
                 settings, 'PLANS_INVOICE_COUNTER_RESET', Invoice.NUMBERING.MONTHLY)
-            invoice_counter_reset_name = invoice_counter_reset
 
-            # To avoid duplicates as well as gaps in the sequence, we are using django-sequences
-            # to generate sequence number for each invoice
-            # We keep the old sequence generating mechanism to get lower initial value,
-            # so that the sequence will continue backward compatibly
-            older_invoices = Invoice.objects.filter(type=self.type)
-            initial_number = None
             if invoice_counter_reset == Invoice.NUMBERING.DAILY:
-                invoice_counter_value = f"{self.issued.year}_{self.issued.month}_{self.issued.day}"
-                older_invoices = older_invoices.filter(issued=self.issued)
+                last_number = Invoice.objects.filter(issued=self.issued, type=self.type).aggregate(Max('number'))[
+                    'number__max'] or 0
             elif invoice_counter_reset == Invoice.NUMBERING.MONTHLY:
-                invoice_counter_value = f"{self.issued.year}_{self.issued.month}"
-                older_invoices = older_invoices.filter(
-                    issued__year=self.issued.year,
-                    issued__month=self.issued.month,
-                )
+                last_number = Invoice.objects.filter(issued__year=self.issued.year, issued__month=self.issued.month,
+                                                     type=self.type).aggregate(Max('number'))['number__max'] or 0
             elif invoice_counter_reset == Invoice.NUMBERING.ANNUALLY:
-                invoice_counter_value = f"{self.issued.year}"
-                older_invoices = older_invoices.filter(issued__year=self.issued.year)
-            elif callable(invoice_counter_reset):
-                invoice_counter_value, initial_number = invoice_counter_reset(self)
-                invoice_counter_reset_name = 'call'
+                last_number = \
+                    Invoice.objects.filter(issued__year=self.issued.year, type=self.type).aggregate(Max('number'))[
+                        'number__max'] or 0
             else:
                 raise ImproperlyConfigured(
                     "PLANS_INVOICE_COUNTER_RESET can be set only to these values: daily, monthly, yearly.")
+            self.number = last_number + 1
 
-            # get initial value for backward compatibility
-            if initial_number:
-                self.initial_number = initial_number
-            else:
-                self.initial_number = get_initial_number(older_invoices)
-            self.sequence_name = f"invoice_numbers_{self.type}_{invoice_counter_reset_name}_{invoice_counter_value}"
-
-    def save(self, *args, **kwargs):
-        with transaction.atomic():
-            if self.number is None:
-                self.number = get_next_value(self.sequence_name, initial_value=self.initial_number)
-            super().save(*args, **kwargs)
-
-        # We need to generate full number based on what invoice sequence number actually ended up in DB
-        self.refresh_from_db()
         if self.full_number == "":
             self.full_number = self.get_full_number()
-        super().save(update_fields=["full_number"])
+        super(Invoice, self).clean()
 
     #    def validate_unique(self, exclude=None):
     #        super(Invoice, self).validate_unique(exclude)
@@ -860,13 +650,8 @@ class Invoice(models.Model):
 
         :return: string (generated full number)
         """
-        format = getattr(
-            settings,
-            "PLANS_INVOICE_NUMBER_FORMAT",
-            "{{ invoice.number }}/"
-            "{% ifequal invoice.type invoice.INVOICE_TYPES.PROFORMA %}PF{% else %}FV{% endifequal %}"
-            "/{{ invoice.issued|date:'m/Y' }}",
-        )
+        format = getattr(settings, "PLANS_INVOICE_NUMBER_FORMAT",
+                         "{{ invoice.number }}/{% ifequal invoice.type invoice.INVOICE_TYPES.PROFORMA %}PF{% else %}FV{% endifequal %}/{{ invoice.issued|date:'m/Y' }}")
         return Template(format).render(Context({'invoice': self}))
 
     def set_issuer_invoice_data(self):
@@ -877,7 +662,7 @@ class Invoice(models.Model):
         """
         try:
             issuer = getattr(settings, 'PLANS_INVOICE_ISSUER')
-        except Exception:
+        except:
             raise ImproperlyConfigured(
                 "Please set PLANS_INVOICE_ISSUER in order to make an invoice.")
         self.issuer_name = issuer['issuer_name']
@@ -958,9 +743,6 @@ class Invoice(models.Model):
             translation.deactivate()
 
     def send_invoice_by_email(self):
-        if self.type in getattr(settings, 'PLANS_SEND_EMAILS_DISABLED_INVOICE_TYPES', []):
-            return
-
         language_code = get_user_language(self.user)
 
         if language_code is not None:
@@ -969,7 +751,6 @@ class Invoice(models.Model):
                         'invoice_type': self.get_type_display(),
                         'invoice_number': self.get_full_number(),
                         'order': self.order.id,
-                        'order_object': self.order,
                         'url': self.get_absolute_url(), }
         if language_code is not None:
             translation.deactivate()
@@ -981,4 +762,4 @@ class Invoice(models.Model):
 
 
 # noinspection PyUnresolvedReferences
-import plans.listeners  # noqa
+import plans.listeners
